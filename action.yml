@@ -10,7 +10,7 @@ inputs:
       required: true
 
     APPLICATION_ID:
-      description: "The ID of the application to deploy"
+      description: "The ID of the application to deploy (can be a single ID or comma-separated list of IDs)"
       required: true
 
     DOCKER_REGISTRY:
@@ -28,63 +28,105 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Deploy
+    - name: Parse Application IDs
       shell: bash
       run: |
-        set -e  # Exit on any error
+        set -e
 
-        echo "Saving Docker provider configuration..."
-        response=$(curl -s -w "\n%{http_code}" -X 'POST' \
-          '${{ inputs.DOKPLOY_HOST }}/api/application.saveDockerProvider' \
-          -H 'accept: application/json' \
-          -H 'Content-Type: application/json' \
-          -H 'x-api-key: ${{ inputs.DOKPLOY_TOKEN }}' \
-          -d '{
-          "dockerImage": "${{ inputs.DOCKER_REGISTRY }}:${{ inputs.DOCKER_TAG }}",
-          "applicationId": "${{ inputs.APPLICATION_ID }}",
-          "username": "",
-          "password": "",
-          "registryUrl": ""
-        }')
+        # Convert APPLICATION_ID input to array, handling both single values and comma-separated lists
+        IFS=',' read -ra APP_IDS <<< "${{ inputs.APPLICATION_ID }}"
 
-        # Extract HTTP status code and response body
-        http_code=$(echo "$response" | tail -n1)
-        response_body=$(echo "$response" | head -n -1)
+        # Clean up whitespace and export for next steps
+        CLEAN_IDS=()
+        for id in "${APP_IDS[@]}"; do
+          # Trim whitespace
+          clean_id=$(echo "$id" | xargs)
+          if [ -n "$clean_id" ]; then
+            CLEAN_IDS+=("$clean_id")
+          fi
+        done
 
-        if [ "$http_code" -ne 200 ]; then
-          echo "Error: Failed to save Docker provider configuration"
-          echo "HTTP Status: $http_code"
-          echo "Response: $response_body"
-          exit 1
-        fi
+        # Export the IDs as a space-separated string for the next steps
+        printf "%s\n" "${CLEAN_IDS[@]}" > /tmp/app_ids.txt
+        echo "Found ${#CLEAN_IDS[@]} application ID(s): ${CLEAN_IDS[*]}"
 
-        echo "Docker provider configuration saved successfully"
+    - name: Save Docker Provider Configuration
+      shell: bash
+      run: |
+        set -e
 
-        # Escape the release body for JSON
+        # Escape the release body for JSON (prepare for later use)
         RELEASE_BODY=$(echo '${{ inputs.RELEASE_DESCRIPTION }}' | jq -Rs .)
+        echo "RELEASE_BODY=$RELEASE_BODY" >> $GITHUB_ENV
 
-        echo "Deploying application..."
-        deploy_response=$(curl -s -w "\n%{http_code}" -X 'POST' \
-          '${{ inputs.DOKPLOY_HOST }}/api/application.deploy' \
-          -H 'accept: application/json' \
-          -H 'Content-Type: application/json' \
-          -H 'x-api-key: ${{ inputs.DOKPLOY_TOKEN }}' \
-          -d "{
-          \"applicationId\": \"${{ inputs.APPLICATION_ID }}\",
-          \"title\": \"Deploying ${{ inputs.DOCKER_TAG }}\",
-          \"description\": $RELEASE_BODY
-        }")
+        # Read application IDs
+        mapfile -t APP_IDS < /tmp/app_ids.txt
 
-        # Extract HTTP status code and response body for deploy request
-        deploy_http_code=$(echo "$deploy_response" | tail -n1)
-        deploy_response_body=$(echo "$deploy_response" | head -n -1)
+        for app_id in "${APP_IDS[@]}"; do
+          echo "Saving Docker provider configuration for application: $app_id"
 
-        if [ "$deploy_http_code" -ne 200 ]; then
-          echo "Error: Failed to deploy application"
-          echo "HTTP Status: $deploy_http_code"
-          echo "Response: $deploy_response_body"
-          exit 1
-        fi
+          response=$(curl -s -w "\n%{http_code}" -X 'POST' \
+            '${{ inputs.DOKPLOY_HOST }}/api/application.saveDockerProvider' \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -H 'x-api-key: ${{ inputs.DOKPLOY_TOKEN }}' \
+            -d "{
+            \"dockerImage\": \"${{ inputs.DOCKER_REGISTRY }}:${{ inputs.DOCKER_TAG }}\",
+            \"applicationId\": \"$app_id\",
+            \"username\": \"\",
+            \"password\": \"\",
+            \"registryUrl\": \"\"
+          }")
 
-        echo "Application deployed successfully"
-        echo "Deploy response: $deploy_response_body"
+          # Extract HTTP status code and response body
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n -1)
+
+          if [ "$http_code" -ne 200 ]; then
+            echo "Error: Failed to save Docker provider configuration for application $app_id"
+            echo "HTTP Status: $http_code"
+            echo "Response: $response_body"
+            exit 1
+          fi
+
+          echo "✓ Docker provider configuration saved successfully for application: $app_id"
+        done
+
+    - name: Deploy Applications
+      shell: bash
+      run: |
+        set -e
+
+        # Read application IDs
+        mapfile -t APP_IDS < /tmp/app_ids.txt
+
+        for app_id in "${APP_IDS[@]}"; do
+          echo "Deploying application: $app_id"
+
+          deploy_response=$(curl -s -w "\n%{http_code}" -X 'POST' \
+            '${{ inputs.DOKPLOY_HOST }}/api/application.deploy' \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -H 'x-api-key: ${{ inputs.DOKPLOY_TOKEN }}' \
+            -d "{
+            \"applicationId\": \"$app_id\",
+            \"title\": \"Deploying ${{ inputs.DOCKER_TAG }}\",
+            \"description\": $RELEASE_BODY
+          }")
+
+          # Extract HTTP status code and response body for deploy request
+          deploy_http_code=$(echo "$deploy_response" | tail -n1)
+          deploy_response_body=$(echo "$deploy_response" | head -n -1)
+
+          if [ "$deploy_http_code" -ne 200 ]; then
+            echo "Error: Failed to deploy application $app_id"
+            echo "HTTP Status: $deploy_http_code"
+            echo "Response: $deploy_response_body"
+            exit 1
+          fi
+
+          echo "✓ Application deployed successfully: $app_id"
+          echo "Deploy response: $deploy_response_body"
+        done
+
+        echo "🎉 All applications deployed successfully!"
