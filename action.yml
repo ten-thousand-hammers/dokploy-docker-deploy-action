@@ -31,7 +31,10 @@ runs:
     - name: Deploy
       shell: bash
       run: |
-        curl -X 'POST' \
+        set -e  # Exit on any error
+
+        echo "Saving Docker provider configuration..."
+        response=$(curl -s -w "\n%{http_code}" -X 'POST' \
           '${{ inputs.DOKPLOY_HOST }}/api/application.saveDockerProvider' \
           -H 'accept: application/json' \
           -H 'Content-Type: application/json' \
@@ -42,12 +45,26 @@ runs:
           "username": "",
           "password": "",
           "registryUrl": ""
-        }'
+        }')
+
+        # Extract HTTP status code and response body
+        http_code=$(echo "$response" | tail -n1)
+        response_body=$(echo "$response" | head -n -1)
+
+        if [ "$http_code" -ne 200 ]; then
+          echo "Error: Failed to save Docker provider configuration"
+          echo "HTTP Status: $http_code"
+          echo "Response: $response_body"
+          exit 1
+        fi
+
+        echo "Docker provider configuration saved successfully"
 
         # Escape the release body for JSON
         RELEASE_BODY=$(echo '${{ inputs.RELEASE_DESCRIPTION }}' | jq -Rs .)
 
-        curl -X 'POST' \
+        echo "Deploying application..."
+        deploy_response=$(curl -s -w "\n%{http_code}" -X 'POST' \
           '${{ inputs.DOKPLOY_HOST }}/api/application.deploy' \
           -H 'accept: application/json' \
           -H 'Content-Type: application/json' \
@@ -56,4 +73,18 @@ runs:
           \"applicationId\": \"${{ inputs.APPLICATION_ID }}\",
           \"title\": \"Deploying ${{ inputs.DOCKER_TAG }}\",
           \"description\": $RELEASE_BODY
-        }"
+        }")
+
+        # Extract HTTP status code and response body for deploy request
+        deploy_http_code=$(echo "$deploy_response" | tail -n1)
+        deploy_response_body=$(echo "$deploy_response" | head -n -1)
+
+        if [ "$deploy_http_code" -ne 200 ]; then
+          echo "Error: Failed to deploy application"
+          echo "HTTP Status: $deploy_http_code"
+          echo "Response: $deploy_response_body"
+          exit 1
+        fi
+
+        echo "Application deployed successfully"
+        echo "Deploy response: $deploy_response_body"
