@@ -52,12 +52,14 @@ runs:
 
     - name: Save Docker Provider Configuration
       shell: bash
+      env:
+        RELEASE_DESCRIPTION: ${{ inputs.RELEASE_DESCRIPTION }}
       run: |
         set -e
 
         # Escape the release body for JSON (prepare for later use)
-        RELEASE_BODY=$(echo '${{ inputs.RELEASE_DESCRIPTION }}' | jq -Rs .)
-        echo "RELEASE_BODY=$RELEASE_BODY" >> $GITHUB_ENV
+        RELEASE_BODY=$(printf '%s' "$RELEASE_DESCRIPTION" | jq -Rs .)
+        printf 'RELEASE_BODY=%s\n' "$RELEASE_BODY" >> "$GITHUB_ENV"
 
         # Read application IDs
         mapfile -t APP_IDS < /tmp/app_ids.txt
