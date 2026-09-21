@@ -1,0 +1,30 @@
+name: "Test"
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Test:
+    name: Wait behaviour
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Check action.yml parses
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('action.yml'))"
+
+      # The polling logic is load-bearing for every repository that deploys with
+      # this action, several of which deploy to more than one application.
+      - name: Run wait tests
+        run: ./test/wait_test.sh
