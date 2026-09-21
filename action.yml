@@ -25,6 +25,24 @@ inputs:
       description: "The description of the release"
       required: false
 
+    WAIT:
+      description: >-
+        Wait for every deployment to finish and fail if any of them does not
+        reach "done". Without this the action returns as soon as Dokploy accepts
+        the request, so a container that never boots still reports success.
+      required: false
+      default: "false"
+
+    WAIT_ATTEMPTS:
+      description: "How many times to poll each application before giving up."
+      required: false
+      default: "60"
+
+    WAIT_INTERVAL_SECONDS:
+      description: "Seconds between polls."
+      required: false
+      default: "10"
+
 runs:
   using: "composite"
   steps:
@@ -50,9 +68,42 @@ runs:
         printf "%s\n" "${CLEAN_IDS[@]}" > /tmp/app_ids.txt
         echo "Found ${#CLEAN_IDS[@]} application ID(s): ${CLEAN_IDS[*]}"
 
+    # Taken before anything is deployed. Dokploy's deploy endpoint does not
+    # return the deployment it created, so the only way to identify it later is
+    # to know which ones already existed -- otherwise a re-deploy of the same tag
+    # would match an older, already-successful deployment and return immediately.
+    - name: Snapshot existing deployments
+      if: ${{ inputs.WAIT == 'true' }}
+      shell: bash
+      env:
+        DOKPLOY_HOST: ${{ inputs.DOKPLOY_HOST }}
+        DOKPLOY_TOKEN: ${{ inputs.DOKPLOY_TOKEN }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t APP_IDS < /tmp/app_ids.txt
+
+        for app_id in "${APP_IDS[@]}"; do
+          response=$(curl --fail-with-body --silent --show-error --retry 3 \
+            --get "$DOKPLOY_HOST/api/deployment.all" \
+            --header "x-api-key: $DOKPLOY_TOKEN" \
+            --data-urlencode "applicationId=$app_id")
+
+          if ! jq -e 'type == "array"' <<< "$response" >/dev/null; then
+            echo "Error: unexpected deployment list for $app_id" >&2
+            exit 1
+          fi
+
+          jq -c '[.[].deploymentId]' <<< "$response" > "/tmp/baseline_${app_id}.json"
+          echo "Baselined $(jq 'length' < "/tmp/baseline_${app_id}.json") deployment(s) for $app_id"
+        done
+
     - name: Save Docker Provider Configuration
       shell: bash
       env:
+        # Through the environment rather than interpolated into the script: a
+        # release body containing a quote would otherwise break the command, and
+        # anything in it would be evaluated by the shell.
         RELEASE_DESCRIPTION: ${{ inputs.RELEASE_DESCRIPTION }}
       run: |
         set -e
@@ -132,3 +183,75 @@ runs:
         done
 
         echo "🎉 All applications deployed successfully!"
+
+    - name: Wait for deployments
+      if: ${{ inputs.WAIT == 'true' }}
+      shell: bash
+      env:
+        DOKPLOY_HOST: ${{ inputs.DOKPLOY_HOST }}
+        DOKPLOY_TOKEN: ${{ inputs.DOKPLOY_TOKEN }}
+        DOCKER_TAG: ${{ inputs.DOCKER_TAG }}
+        WAIT_ATTEMPTS: ${{ inputs.WAIT_ATTEMPTS }}
+        WAIT_INTERVAL_SECONDS: ${{ inputs.WAIT_INTERVAL_SECONDS }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t APP_IDS < /tmp/app_ids.txt
+        deployment_title="Deploying $DOCKER_TAG"
+        failed=0
+
+        # Every application is waited on, even after one fails, so the log shows
+        # the whole picture rather than stopping at the first bad one.
+        for app_id in "${APP_IDS[@]}"; do
+          echo "::group::Waiting for $app_id"
+          existing="$(cat "/tmp/baseline_${app_id}.json")"
+          result="timeout"
+
+          for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
+            response=$(curl --fail-with-body --silent --show-error --retry 3 \
+              --get "$DOKPLOY_HOST/api/deployment.all" \
+              --header "x-api-key: $DOKPLOY_TOKEN" \
+              --data-urlencode "applicationId=$app_id")
+
+            deployment=$(jq -c \
+              --arg title "$deployment_title" \
+              --argjson existing "$existing" '
+              [
+                .[]
+                | select(.title == $title)
+                | select(.deploymentId as $id | ($existing | index($id)) == null)
+              ]
+              | sort_by(.createdAt)
+              | last // empty
+            ' <<< "$response")
+
+            if [ -z "$deployment" ]; then
+              echo "Waiting for Dokploy to create the deployment ($attempt/$WAIT_ATTEMPTS)"
+            else
+              status=$(jq -r '.status' <<< "$deployment")
+              echo "Deployment $(jq -r '.deploymentId' <<< "$deployment") is $status ($attempt/$WAIT_ATTEMPTS)"
+              case "$status" in
+                done) result="done"; break ;;
+                error|cancelled)
+                  jq -r '.errorMessage // "Deployment failed"' <<< "$deployment" >&2
+                  result="$status"; break
+                  ;;
+                running) ;;
+                *) echo "Unexpected status: $status" >&2; result="unknown"; break ;;
+              esac
+            fi
+
+            [ "$attempt" -lt "$WAIT_ATTEMPTS" ] && sleep "$WAIT_INTERVAL_SECONDS"
+          done
+
+          echo "::endgroup::"
+          if [ "$result" = "done" ]; then
+            echo "✓ $app_id deployed"
+          else
+            echo "::error::$app_id did not deploy ($result)"
+            failed=1
+          fi
+        done
+
+        [ "$failed" -eq 0 ] || exit 1
+        echo "🎉 All deployments reached done"
