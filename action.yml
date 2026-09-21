@@ -64,6 +64,14 @@ runs:
           fi
         done
 
+        # An empty or whitespace-only input would otherwise leave every loop
+        # below with nothing to iterate over, and the action would report
+        # success without having deployed anything.
+        if [ "${#CLEAN_IDS[@]}" -eq 0 ]; then
+          echo "::error::APPLICATION_ID is empty; nothing to deploy"
+          exit 1
+        fi
+
         # Export the IDs as a space-separated string for the next steps
         printf "%s\n" "${CLEAN_IDS[@]}" > /tmp/app_ids.txt
         echo "Found ${#CLEAN_IDS[@]} application ID(s): ${CLEAN_IDS[*]}"
