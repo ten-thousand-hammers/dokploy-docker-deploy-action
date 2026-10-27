@@ -21,15 +21,47 @@ on:
 
 jobs:
   dokploy_deploy:
-    uses: ten-thousand-hammers/dokploy-docker-deploy-actions@main
-    with:
-      DOKPLOY_HOST: https://dokploy.example.com
-      DOKPLOY_TOKEN: ${{ secrets.DOKPLOY_AUTH_TOKEN }}
-      APPLICATION_ID: ${{ env.DOKPLOY_APPLICATION_ID }}
-      DOCKER_REGISTRY: ghcr.io/example/home
-      DOCKER_TAG: ${{ env.CUSTOM_TAG }}
-      RELEASE_DESCRIPTION: ${{ github.event.release.body }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ten-thousand-hammers/dokploy-docker-deploy-action@v1
+        with:
+          DOKPLOY_HOST: https://dokploy.example.com
+          DOKPLOY_TOKEN: ${{ secrets.DOKPLOY_AUTH_TOKEN }}
+          APPLICATION_ID: ${{ vars.DOKPLOY_APPLICATION_ID }}
+          DOCKER_REGISTRY: ghcr.io/example/home
+          DOCKER_TAG: ${{ env.CUSTOM_TAG }}
+          RELEASE_DESCRIPTION: ${{ github.event.release.body }}
 ```
+
+## Private registries
+
+Dokploy pulls the image with the credentials stored **on the application**, and
+that is the only place it looks — a registry entry configured in the Dokploy UI
+is not consulted for an application that deploys a prebuilt image. Supply
+`REGISTRY_USERNAME` and `REGISTRY_PASSWORD` and the action writes them to every
+application it deploys:
+
+```yaml
+- uses: ten-thousand-hammers/dokploy-docker-deploy-action@v1
+  with:
+    DOKPLOY_HOST: https://dokploy.example.com
+    DOKPLOY_TOKEN: ${{ secrets.DOKPLOY_AUTH_TOKEN }}
+    APPLICATION_ID: ${{ vars.DOKPLOY_APPLICATION_ID }}
+    DOCKER_REGISTRY: ghcr.io/org/app
+    DOCKER_TAG: 2026.9.21-1
+    REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+    REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+```
+
+`REGISTRY_URL` is optional and defaults to the host of `DOCKER_REGISTRY`
+(`ghcr.io` for `ghcr.io/org/app`). The password is never printed; the log only
+names the registry and the username.
+
+Leave both unset and the registry fields are omitted from the request entirely,
+so credentials already stored on the application are left alone. That matters:
+Dokploy's `saveDockerProvider` is a partial update that writes every field it
+receives, so sending empty strings wipes stored credentials and the next pull of
+a private image fails with `denied: denied`.
 
 ## Waiting for the deployment
 
