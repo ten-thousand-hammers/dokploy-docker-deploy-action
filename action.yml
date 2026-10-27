@@ -43,6 +43,27 @@ inputs:
       required: false
       default: "10"
 
+    REGISTRY_USERNAME:
+      description: >-
+        Username for a private registry. Supplying it (with REGISTRY_PASSWORD)
+        stores the credentials on every application so Dokploy can pull the
+        image. Omit both to leave whatever credentials the applications already
+        hold untouched.
+      required: false
+      default: ""
+
+    REGISTRY_PASSWORD:
+      description: "Password or token for a private registry. See REGISTRY_USERNAME."
+      required: false
+      default: ""
+
+    REGISTRY_URL:
+      description: >-
+        Registry host to authenticate against, e.g. ghcr.io. Defaults to the
+        host of DOCKER_REGISTRY when credentials are supplied.
+      required: false
+      default: ""
+
 runs:
   using: "composite"
   steps:
@@ -113,31 +134,61 @@ runs:
         # release body containing a quote would otherwise break the command, and
         # anything in it would be evaluated by the shell.
         RELEASE_DESCRIPTION: ${{ inputs.RELEASE_DESCRIPTION }}
+        DOKPLOY_HOST: ${{ inputs.DOKPLOY_HOST }}
+        DOKPLOY_TOKEN: ${{ inputs.DOKPLOY_TOKEN }}
+        DOCKER_REGISTRY: ${{ inputs.DOCKER_REGISTRY }}
+        DOCKER_TAG: ${{ inputs.DOCKER_TAG }}
+        REGISTRY_USERNAME: ${{ inputs.REGISTRY_USERNAME }}
+        REGISTRY_PASSWORD: ${{ inputs.REGISTRY_PASSWORD }}
+        REGISTRY_URL: ${{ inputs.REGISTRY_URL }}
       run: |
-        set -e
+        set -euo pipefail
 
         # Escape the release body for JSON (prepare for later use)
-        RELEASE_BODY=$(printf '%s' "$RELEASE_DESCRIPTION" | jq -Rs .)
+        RELEASE_BODY=$(printf '%s' "${RELEASE_DESCRIPTION:-}" | jq -Rs .)
         printf 'RELEASE_BODY=%s\n' "$RELEASE_BODY" >> "$GITHUB_ENV"
 
         # Read application IDs
         mapfile -t APP_IDS < /tmp/app_ids.txt
 
+        # Default the registry host to the image's own registry, so a caller can
+        # supply just a username and password.
+        registry_url="${REGISTRY_URL:-}"
+        if [ -n "${REGISTRY_USERNAME:-}" ] && [ -z "$registry_url" ]; then
+          registry_url="${DOCKER_REGISTRY%%/*}"
+        fi
+
         for app_id in "${APP_IDS[@]}"; do
           echo "Saving Docker provider configuration for application: $app_id"
 
+          # Only send the registry fields that were actually supplied.
+          # saveDockerProvider is a partial update that writes every field it is
+          # given, so sending empty strings wipes credentials already stored on
+          # the application -- and the next deploy then fails to pull a private
+          # image, which looks like a registry outage rather than a config write.
+          body=$(jq -cn \
+            --arg dockerImage "$DOCKER_REGISTRY:$DOCKER_TAG" \
+            --arg applicationId "$app_id" \
+            --arg username "${REGISTRY_USERNAME:-}" \
+            --arg password "${REGISTRY_PASSWORD:-}" \
+            --arg registryUrl "$registry_url" \
+            '{dockerImage: $dockerImage, applicationId: $applicationId}
+             + (if $username != "" then {username: $username} else {} end)
+             + (if $password != "" then {password: $password} else {} end)
+             + (if $registryUrl != "" then {registryUrl: $registryUrl} else {} end)')
+
+          if [ -n "${REGISTRY_USERNAME:-}" ]; then
+            echo "  sending registry credentials for $registry_url as $REGISTRY_USERNAME"
+          else
+            echo "  no registry credentials supplied; leaving any stored on the application alone"
+          fi
+
           response=$(curl -s -w "\n%{http_code}" -X 'POST' \
-            '${{ inputs.DOKPLOY_HOST }}/api/application.saveDockerProvider' \
+            "$DOKPLOY_HOST/api/application.saveDockerProvider" \
             -H 'accept: application/json' \
             -H 'Content-Type: application/json' \
-            -H 'x-api-key: ${{ inputs.DOKPLOY_TOKEN }}' \
-            -d "{
-            \"dockerImage\": \"${{ inputs.DOCKER_REGISTRY }}:${{ inputs.DOCKER_TAG }}\",
-            \"applicationId\": \"$app_id\",
-            \"username\": \"\",
-            \"password\": \"\",
-            \"registryUrl\": \"\"
-          }")
+            -H "x-api-key: $DOKPLOY_TOKEN" \
+            -d "$body")
 
           # Extract HTTP status code and response body
           http_code=$(echo "$response" | tail -n1)
