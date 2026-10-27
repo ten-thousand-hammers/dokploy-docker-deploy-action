@@ -57,11 +57,12 @@ application it deploys:
 (`ghcr.io` for `ghcr.io/org/app`). The password is never printed; the log only
 names the registry and the username.
 
-Leave both unset and the registry fields are omitted from the request entirely,
-so credentials already stored on the application are left alone. That matters:
-Dokploy's `saveDockerProvider` is a partial update that writes every field it
-receives, so sending empty strings wipes stored credentials and the next pull of
-a private image fails with `denied: denied`.
+Leave both unset and the action reads the application first and sends its stored
+username, password and registry host back unchanged. That matters: Dokploy's
+`saveDockerProvider` requires all three fields and writes every one it receives,
+so sending empty strings wipes stored credentials and the next pull of a private
+image fails with `denied: denied` — which reads like a registry outage rather
+than a config write.
 
 ## Waiting for the deployment
 

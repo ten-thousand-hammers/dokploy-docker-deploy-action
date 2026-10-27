@@ -151,37 +151,44 @@ runs:
         # Read application IDs
         mapfile -t APP_IDS < /tmp/app_ids.txt
 
-        # Default the registry host to the image's own registry, so a caller can
-        # supply just a username and password.
-        registry_url="${REGISTRY_URL:-}"
-        if [ -n "${REGISTRY_USERNAME:-}" ] && [ -z "$registry_url" ]; then
-          registry_url="${DOCKER_REGISTRY%%/*}"
-        fi
-
         for app_id in "${APP_IDS[@]}"; do
           echo "Saving Docker provider configuration for application: $app_id"
 
-          # Only send the registry fields that were actually supplied.
-          # saveDockerProvider is a partial update that writes every field it is
-          # given, so sending empty strings wipes credentials already stored on
-          # the application -- and the next deploy then fails to pull a private
-          # image, which looks like a registry outage rather than a config write.
+          username="${REGISTRY_USERNAME:-}"
+          password="${REGISTRY_PASSWORD:-}"
+          registry_url="${REGISTRY_URL:-}"
+
+          if [ -n "$username" ]; then
+            # Default the registry host to the image's own registry, so a caller
+            # can supply just a username and password.
+            [ -n "$registry_url" ] || registry_url="${DOCKER_REGISTRY%%/*}"
+            echo "  sending registry credentials for $registry_url as $username"
+          else
+            # saveDockerProvider requires all three registry fields and writes
+            # every one of them, so an empty string here would wipe credentials
+            # the application already holds -- and the next deploy then fails to
+            # pull a private image, which looks like a registry outage rather
+            # than a config write. Carry the stored values through instead.
+            current=$(curl --fail-with-body --silent --show-error \
+              --get "$DOKPLOY_HOST/api/application.one" \
+              --header "x-api-key: $DOKPLOY_TOKEN" \
+              --data-urlencode "applicationId=$app_id")
+
+            username=$(jq -r '.username // ""' <<< "$current")
+            password=$(jq -r '.password // ""' <<< "$current")
+            registry_url=$(jq -r '.registryUrl // ""' <<< "$current")
+            echo "  no registry credentials supplied; keeping any already stored on the application"
+          fi
+
+          # Never echo the credential itself: only whether one is being sent.
           body=$(jq -cn \
             --arg dockerImage "$DOCKER_REGISTRY:$DOCKER_TAG" \
             --arg applicationId "$app_id" \
-            --arg username "${REGISTRY_USERNAME:-}" \
-            --arg password "${REGISTRY_PASSWORD:-}" \
+            --arg username "$username" \
+            --arg password "$password" \
             --arg registryUrl "$registry_url" \
-            '{dockerImage: $dockerImage, applicationId: $applicationId}
-             + (if $username != "" then {username: $username} else {} end)
-             + (if $password != "" then {password: $password} else {} end)
-             + (if $registryUrl != "" then {registryUrl: $registryUrl} else {} end)')
-
-          if [ -n "${REGISTRY_USERNAME:-}" ]; then
-            echo "  sending registry credentials for $registry_url as $REGISTRY_USERNAME"
-          else
-            echo "  no registry credentials supplied; leaving any stored on the application alone"
-          fi
+            '{dockerImage: $dockerImage, applicationId: $applicationId,
+              username: $username, password: $password, registryUrl: $registryUrl}')
 
           response=$(curl -s -w "\n%{http_code}" -X 'POST' \
             "$DOKPLOY_HOST/api/application.saveDockerProvider" \

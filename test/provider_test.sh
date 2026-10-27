@@ -3,9 +3,11 @@
 # a mocked Dokploy API. The step is extracted from the action rather than copied,
 # so the test always runs the code the action actually ships.
 #
-# The behaviour that matters: saveDockerProvider is a partial update, so any
-# registry field sent with an empty value overwrites real credentials stored on
-# the application and the next deploy cannot pull a private image.
+# The behaviour that matters: saveDockerProvider requires username, password and
+# registryUrl and writes every one of them, so a deploy that supplies no
+# credentials must carry the application's stored ones through instead of
+# wiping them. Wiping them breaks the next pull of a private image with
+# "denied: denied", which reads like a registry outage.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,7 +26,10 @@ sys.stdout.write(step["run"])
 PY
 }
 
-# run_save <app ids>; optional RU/RP/RURL/MOCK_CODE env
+# run_save <app ids>
+#   STORED_JSON  body /api/application.one answers with (default: no credentials)
+#   RU/RP/RURL   credentials supplied to the step
+#   MOCK_CODE    HTTP status the POST answers with
 run_save() {
   local app_ids="$1"
   local dir; dir="$(mktemp -d)"
@@ -32,6 +37,15 @@ run_save() {
 
   cat > "$dir/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
+# Answer the read of the application, or record the write's JSON body.
+for arg in "$@"; do
+  if [[ "$arg" == *"application.one"* ]]; then
+    echo get > "$MOCK_DIR/gets"
+    printf '%s' "${STORED_JSON:-{\}}"
+    exit 0
+  fi
+done
+
 count=0
 [[ -f "$MOCK_DIR/count" ]] && count="$(< "$MOCK_DIR/count")"
 count=$((count + 1))
@@ -51,6 +65,7 @@ MOCK
   PATH="$dir/bin:$PATH" \
   MOCK_DIR="$dir" \
   MOCK_CODE="${MOCK_CODE}" \
+  STORED_JSON="${STORED_JSON:-}" \
   GITHUB_ENV="$dir/github_env" \
   DOKPLOY_HOST="https://dokploy.example.test" \
   DOKPLOY_TOKEN="test-token" \
@@ -65,7 +80,7 @@ MOCK
   return $code
 }
 
-# assert <label> <python expression using d (payload dict)>
+# assert_payload <label> <python expression using d> [file]
 assert_payload() {
   local label="$1" expr="$2" file="${3:-payload-1.json}"
   local ok=0
@@ -96,23 +111,38 @@ check() {
 
 echo "dokploy save docker provider"
 
-# No credentials supplied: the registry fields must be absent entirely, so
-# credentials already stored on the application survive.
+# A deploy that supplies no credentials must preserve what the application holds.
+STORED_JSON='{"username":"stored-user","password":"stored-token","registryUrl":"ghcr.io","dockerImage":"ghcr.io/example/app:2026.8.1-9"}'
 out="$(run_save app1)"; st=$?
-check "omits registry fields when no credentials are supplied" 0 "$out" $st \
-  "leaving any stored on the application alone" "saved successfully"
-assert_payload "payload carries the image and the application id" \
+check "keeps stored credentials when none are supplied" 0 "$out" $st \
+  "keeping any already stored on the application" "saved successfully"
+assert_payload "payload carries the stored username" "d['username'] == 'stored-user'"
+assert_payload "payload carries the stored password" "d['password'] == 'stored-token'"
+assert_payload "payload carries the stored registry host" "d['registryUrl'] == 'ghcr.io'"
+assert_payload "payload carries the image being released" \
   "d['dockerImage'] == 'ghcr.io/example/app:2026.8.2-1' and d['applicationId'] == 'app1'"
-assert_payload "payload has no username key" "'username' not in d"
-assert_payload "payload has no password key" "'password' not in d"
-assert_payload "payload has no registryUrl key" "'registryUrl' not in d"
+assert_payload "payload has all three registry fields" \
+  "all(k in d for k in ('username','password','registryUrl'))"
 
-# Credentials supplied: sent, with the registry host derived from the image.
+# An application with no stored credentials stays that way (nothing to lose).
+STORED_JSON='{"username":"","password":"","registryUrl":""}'
+out="$(run_save app1)"; st=$?
+check "handles an application with no stored credentials" 0 "$out" $st "saved successfully"
+assert_payload "sends empty registry fields when the application has none" \
+  "d['username'] == '' and d['password'] == '' and d['registryUrl'] == ''"
+
+# Credentials supplied: sent as given, with the registry host derived from the image.
+STORED_JSON='{"username":"stored-user","password":"stored-token","registryUrl":"ghcr.io"}'
 RU="bot" RP="s3cret-token" out="$(run_save app1)"; st=$?
 check "sends supplied credentials" 0 "$out" $st "sending registry credentials for ghcr.io as bot"
-assert_payload "payload carries the username" "d['username'] == 'bot'"
-assert_payload "payload carries the password" "d['password'] == 's3cret-token'"
+assert_payload "payload carries the supplied username" "d['username'] == 'bot'"
+assert_payload "payload carries the supplied password" "d['password'] == 's3cret-token'"
 assert_payload "registry host defaults to the image registry" "d['registryUrl'] == 'ghcr.io'"
+if [[ -f "$(cat "$LAST_DIR_FILE")/gets" ]]; then
+  echo "  FAIL supplied credentials still read the application first"; FAIL=$((FAIL+1))
+else
+  echo "  OK   supplied credentials need no read of the application"; PASS=$((PASS+1))
+fi
 if [[ "$out" == *"s3cret-token"* ]]; then
   echo "  FAIL password is echoed into the log"; FAIL=$((FAIL+1))
 else
@@ -125,6 +155,7 @@ check "honours an explicit REGISTRY_URL" 0 "$out" $st "for https://index.docker.
 assert_payload "payload carries the explicit registry url" "d['registryUrl'] == 'https://index.docker.io/v1/'"
 
 # Every application gets its own write.
+STORED_JSON='{"username":"u","password":"p","registryUrl":"ghcr.io"}'
 out="$(run_save "app1 app2")"; st=$?
 check "writes once per application" 0 "$out" $st "app1" "app2"
 assert_payload "second application gets its own payload" "d['applicationId'] == 'app2'" payload-2.json
